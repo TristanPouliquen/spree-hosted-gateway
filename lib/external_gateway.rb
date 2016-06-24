@@ -136,9 +136,9 @@ class ExternalGateway < PaymentMethod
   #to complete the order.
   def get_callback_url_for(order, on_admin_page = false)
     if on_admin_page
-      return admin_gateway_landing_url(:host => Spree::Config[:site_url], @order['number'])
+      return admin_gateway_landing_url(@order['number'])
     else
-      return gateway_landing_url(:host => Spree::Config[:site_url], @order['number'])
+      return gateway_landing_url(@order['number'])
     end
   end
 
