@@ -1,4 +1,4 @@
-class ExternalGateway < PaymentMethod
+class ExternalGateway < Spree::PaymentMethod
 
   #We need access to routes to correctly assemble a return url
  include ActionController::UrlWriter
