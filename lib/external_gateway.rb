@@ -36,15 +36,46 @@ class ExternalGateway < PaymentMethod
   def process_response(params)
     begin
       #Find order
-      order = Order.find_by_number(ExternalGateway.parse_custom_data(params)["order_number"])
-      raise ActiveRecord::RecordNotFound if order.token != ExternalGateway.parse_custom_data(params)["order_token"]
-
+      order = Order.find_by_number(params["order"])
+      boleta_factura =BoletaFactura.find_by_factura(params['order'])
+      boleta = getBoleta(boleta_factura[:boleta])[0]
       #Check for successful response
-      transaction_succeeded = params[self.preferred_status_param_key.to_sym] == self.preferred_successful_transaction_value.to_s
-      return [order, transaction_succeeded]
+      transaction_succeeded = boleta['estado'] == 'pagada'
+
+      if !boleta_factura['processed']
+        boleta_factura.update(processed: true)
+        if transaction_succeeded
+          order.update(state: 'complete', completed_at: Time.now)
+          address = Address.find(order['ship_address_id'])
+          address_string = formatAddress(address)
+          order.line_items.each do |item|
+            variant = Variant.find(item['variant_id'])
+            if variant.nil?
+              next
+            else
+              sku = variant['sku']
+              quantity = item['quantity']
+              price = item['price']
+
+              Thread.new do
+                stock_item = StockItem.find_by_variant_id(variant['id'])
+                stock_item.adjust_count_on_hand(-quantity)
+                stock_item.save
+                dispatchBatch(quantity, sku, price.to_i, boleta_factura[:boleta], address_string)
+              end
+            end
+          end
+          flash[:success] = "Your order #{params[:factura]} was correctly processed"
+        else
+          order.update(state: 'canceled',completed_at: Time.now)
+          flash[:error] = "Your order #{params[:factura]} did not terminate correctly"
+        end
+      end
+
+      return [order, boleta, transaction_succeeded]
     rescue ActiveRecord::RecordNotFound
       #Return nil and false if we couldn't find the order - this is probably bad.
-      return [nil, false]
+      return [nil, nil, false]
     end
   end
 
@@ -76,7 +107,25 @@ class ExternalGateway < PaymentMethod
   #The payment gateway I'm using only accepts rounded-dollar amounts. Stupid.
   #I've added this method nonetheless, so that I can easily override it to round the amount
   def get_total_for(order)
-    return order.total
+    return order.total.to_i
+  end
+
+  # Method that generates and returns the boletaId associated with the order
+  def get_boletaId_for(order)
+    boleta_factura = BoletaFactura.find_by_factura(order['number'])
+    if boleta_factura.nil?
+      boleta_creation = put(ENV['general_system_url'] + 'facturas/boleta', data = {'proveedor' => ENV['id_grupo'], 'cliente' => order['email'], 'total' => order['item_total'].to_i})
+
+      if boleta_creation.kind_of? Net::HTTPSuccess
+        BoletaFactura.create(factura: order['number'], boleta: JSON.parse(boleta_creation.body)['_id'])
+        return JSON.parse(boleta_creation.body)['_id']
+      else
+        flash[:error] = "An error occured in the process of your order: " + boleta_creation.body
+        redirect_to '/spree/checkout/delivery'
+      end
+    else
+      return boleta_factura['boleta']
+    end
   end
 
   #This is another attr_reader, but does a couple of necessary things to make sure we can keep track
@@ -85,11 +134,11 @@ class ExternalGateway < PaymentMethod
   #admin checkout page (in which case we need to redirect to a different path), a full return url can be
   #assembled that will redirect back to the correct page
   #to complete the order.
-  def get_return_url_for(order, on_admin_page = false)
+  def get_callback_url_for(order, on_admin_page = false)
     if on_admin_page
-      return admin_gateway_landing_url(:host => Spree::Config[:site_url])
+      return admin_gateway_landing_url(:host => Spree::Config[:site_url], @order['number'])
     else
-      return gateway_landing_url(:host => Spree::Config[:site_url])
+      return gateway_landing_url(:host => Spree::Config[:site_url], @order['number'])
     end
   end
 
@@ -101,5 +150,96 @@ class ExternalGateway < PaymentMethod
     self.preferences.select { |key| !INTERNAL_PREFERENCES.include?(key[0].to_sym) }
   end
 
-end
+  # Method to process PUT requests
+  def put(uri, data={}, hmac=nil)
+    uri = URI.parse(uri)
+    http = Net::HTTP.new(uri.host, uri.port)
 
+    request = Net::HTTP::Put.new(uri.request_uri, initheader = {'Content-Type' => 'application/json'})
+    if hmac
+      request["Authorization"] = hmac
+    end
+    request.set_form_data(data)
+
+    return http.request(request)
+  end
+
+  def getBoleta(idBoleta)
+    response = get(ENV["general_system_url"] + "facturas/" + idBoleta.to_s)
+
+    bill = JSON.parse(response.body)
+    return bill
+  rescue JSON::ParserError
+    return {}
+  end
+
+  def get(uri, hmac=nil)
+    uri = URI.parse(uri)
+    http = Net::HTTP.new(uri.host, uri.port)
+
+    request = Net::HTTP::Get.new(uri.request_uri, initheader = {'Content-Type' => 'application/json'})
+    if hmac
+      request["Authorization"] = hmac
+    end
+
+    return http.request(request)
+  end
+
+  def delete(uri, data={}, hmac=nil)
+    uri = URI.parse(uri)
+    http = Net::HTTP.new(uri.host, uri.port)
+
+    request = Net::HTTP::Delete.new(uri.request_uri, initheader = {'Content-Type' => 'application/json'})
+    request.set_form_data(data)
+    if hmac
+      request["Authorization"] = hmac
+    end
+
+    return http.request(request)
+  end
+
+  def dispatchBatch(amount, sku, precio, idOc, direccion)
+    amount = amount.to_i
+    while amount > 200
+      response = getStock(ENV['almacen_despacho'], sku, 200)
+      if response.kind_of? Net::HTTPSuccess
+        originProductList = JSON.parse(response.body)
+        originProductList.each do |product|
+          despacharStock(product['_id'], direccion, precio, idOc)
+        end
+      end
+      amount -= 200
+    end
+
+    response = getStock(ENV['almacen_despacho'], sku, amount)
+    if response.kind_of? Net::HTTPSuccess
+      originProductList = JSON.parse(response.body)
+      originProductList.each do |product|
+        despacharStock(product['_id'], direccion, precio, idOc)
+      end
+    end
+  end
+
+  def despacharStock(productoId, direccion, precio, oc)
+    hmac = generateHash('DELETE'+ productoId.to_s + direccion.to_s + precio.to_s + oc.to_s)
+    uri  = ENV['bodega_system_url'] + 'stock'
+    data = {'productoId' => productoId, 'direccion' => direccion, 'precio' => precio, 'oc' => oc}
+    return delete(uri,data=data, hmac= hmac)
+  end
+
+  def getStock(almacenId, sku, limit=nil)
+    hmac = generateHash('GET' +  almacenId.to_s + sku.to_s)
+    if limit.nil?
+      uri = ENV['bodega_system_url'] + 'stock?almacenId=' + almacenId.to_s + '&sku=' + sku.to_s
+    else
+      uri = ENV['bodega_system_url'] + 'stock?almacenId=' + almacenId.to_s + '&sku=' + sku.to_s + '&limit=' + limit.to_s
+    end
+
+    return get(uri, hmac= hmac)
+  end
+
+  def formatAddress(address)
+    return address['address1'] + "\n" + address['address2'] + "\n" + address['city'] + " " + address['zipcode']
+  end
+
+end
