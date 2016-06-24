@@ -1,5 +1,4 @@
 require 'spree_core'
-require 'hosted_gateway_hooks'
 
 module HostedGateway
   class Engine < Rails::Engine
